@@ -19,15 +19,15 @@ const byte MLX90640_address = 0x33; // Default 7-bit unshifted address
 #define TA_SHIFT 8 // Default shift for MLX90640 in open air
 
 // Detection tuning parameters
-#define TEMP_THRESHOLD 28.0       // Minimum temperature (°C) to qualify as a hotspot
-#define HOTSPOT_RADIUS 4          // Radius for local maximum comparison (2 = 5x5 neighborhood window)
+#define TEMP_THRESHOLD 25.0       // Minimum temperature (°C) to qualify as a hotspot
+#define HOTSPOT_RADIUS 5        // Radius for local maximum comparison (2 = 5x5 neighborhood window)
 
 static float mlx90640To[768];
 paramsMLX90640 mlx90640;
 
 void setup() {
     Wire.begin();
-    Wire.setClock(400000); // Increase I2C clock speed to 400kHz
+    Wire.setClock(1000000); // Increase I2C clock speed to 400kHz
 
     debug.begin(115200);
     while (!debug); 
@@ -48,7 +48,7 @@ void setup() {
     if (status != 0) debug.println("Parameter extraction failed");
 
     // Set refresh rate to 8Hz (0x04)
-    MLX90640_SetRefreshRate(MLX90640_address, 0x04);
+    MLX90640_SetRefreshRate(MLX90640_address, 0x05);
 }
 
 void loop() {

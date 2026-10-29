@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 # --- CONFIGURATION ---
 PORT = '/dev/cu.usbserial-0001'
-BAUD = 921600
+BAUD = 115200
 TEMP_THRESHOLD = 29.0  # Minimum temperature (°C) to qualify as a hotspot
 HOTSPOT_RADIUS = 3     # Must match Arduino's radius setting (3 = 7x7 window)
 # ---------------------
@@ -52,7 +52,7 @@ def find_hotspots(grid, threshold, radius):
                     if dr == 0 and dc == 0:
                         continue
                     if grid[r + dr, c + dc] >= val:
-                        is_local_max = false
+                        is_local_max = False
                         break
                 if not is_local_max:
                     break

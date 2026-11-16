@@ -19,7 +19,7 @@ const byte MLX90640_address = 0x33; // Default 7-bit unshifted address
 #define TA_SHIFT 8 // Default shift for MLX90640 in open air
 
 // Detection tuning parameters
-#define TEMP_THRESHOLD 25.0       // Minimum temperature (°C) to qualify as a hotspot
+#define TEMP_THRESHOLD 30.0       // Minimum temperature (°C) to qualify as a hotspot
 #define HOTSPOT_RADIUS 5        // Radius for local maximum comparison (2 = 5x5 neighborhood window)
 
 static float mlx90640To[768];
@@ -93,7 +93,7 @@ void loop() {
     }
     debug.println("========================================\n");
 
-    delay(1000); // 1 second pacing between full frame evaluations
+    delay(0); // 1 second pacing between full frame evaluations
 }
 
 // Scans grid for strict local maximums within HOTSPOT_RADIUS, prints details, and returns count

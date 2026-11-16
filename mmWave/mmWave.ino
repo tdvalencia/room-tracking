@@ -1,145 +1,200 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include "LD2450.h"
+#include "DoorCounter.h"
 
 // --- Wi-Fi & Server Configuration ---
 const char* ssid = "MWireless";
 const char* password = "YOUR_WIFI_PASSWORD";
 const char* serverUrl = "http://your-central-server.local/api/occupancy";
+const bool ENABLE_WIFI = false;
 
-// --- Hardware UART Configuration (ESP32 UART2) ---
-#define RADAR_RX_PIN 16  // Connect to LD2450 TX
-#define RADAR_TX_PIN 17  // Connect to LD2450 RX
-#define RADAR_BAUD   256000
+// --- Radar UART ---
+// The LD2450 is wired to the USB-serial pins: LD2450 TX -> GPIO3 (RX0) and
+// LD2450 RX -> GPIO1 (TX0). GPIO3 is handed to UART2 at 256000 baud for the
+// radar, while UART0 keeps GPIO1 for Serial Monitor output at 115200. As a
+// result the ESP32 cannot receive Serial Monitor input or send radar commands
+// (the radar ignores the debug text it receives on GPIO1).
+// Unpower the radar while uploading: it drives the same line as the USB chip.
+#define RADAR_RX_PIN 3
+#define RADAR_TX_PIN -1
 
-// --- Spatial Geometry & Hysteresis Constants (in mm) ---
-// Per deployment strategy: 1.0m < Y < 6.0m, Hysteresis at +/- 150mm
-const int16_t HYSTERESIS_MM = 150; 
-const int16_t MIN_Y_MM      = 1000; 
-const int16_t MAX_Y_MM      = 6000; 
+#define LED_PIN 2   // On-board LED on most ESP32 dev boards
+#define BUTTON_PIN 0  // BOOT button, usable as an input after boot
 
-// --- Tracking State Structures ---
-enum ZoneState {
-  ZONE_UNKNOWN = 0,
-  ZONE_OUTSIDE = -1, // X < -150 mm
-  ZONE_INSIDE  = 1   // X > +150 mm
-};
+LD2450 radar;
+DoorCounter counter;
 
-struct TargetTracker {
-  ZoneState lastZone = ZONE_UNKNOWN;
-  uint32_t lastSeenMs = 0;
-  bool active = false;
-};
-
-TargetTracker targets[3];
-int roomOccupancy = 0;
-const uint32_t TARGET_TIMEOUT_MS = 1500; // Reset target state if lost for 1.5s
-
-// --- UART Frame Parser Variables ---
-// Full frame: [AA FF 03 00] (4B) + [Target 1] (8B) + [Target 2] (8B) + [Target 3] (8B) + [55 CC] (2B) = 30 Bytes
-const uint8_t HEADER[4] = {0xAA, 0xFF, 0x03, 0x00};
-uint8_t payloadBuf[26]; // 24 bytes for 3 targets + 2 footer bytes
-int headerIdx = 0;
+// Controls (BOOT button, since the Serial Monitor cannot send input):
+//   short press        reset counts
+//   hold 1-3 s         toggle live target/track printout (use to tune geometry)
+//   hold > 3 s         swap which side is inside (also resets counts)
+bool debugStream = false;
 
 void sendOccupancyUpdate(int count);
 
-void setup() {
-  Serial.begin(115200);
-  Serial2.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+// Non-blocking LED feedback: entry = one long blink, exit = two short blinks.
+// Each pattern is a list of on/off durations in ms, starting with "on".
+const uint16_t BLINK_ENTER[] = {400};
+const uint16_t BLINK_EXIT[] = {120, 120, 120};
+const uint16_t* blinkPattern = nullptr;
+uint8_t blinkLen = 0;
+uint8_t blinkStep = 0;
+uint32_t blinkStepStart = 0;
 
-  // // Connect to WPA Wi-Fi
-  // WiFi.begin(ssid, password);
-  // Serial.print("Connecting to Wi-Fi");
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   delay(500);
-  //   Serial.print(".");
-  // }
-  // Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+void startBlink(const uint16_t* pattern, uint8_t len) {
+  blinkPattern = pattern;
+  blinkLen = len;
+  blinkStep = 0;
+  blinkStepStart = millis();
+  digitalWrite(LED_PIN, HIGH);
 }
 
-// Helper to parse a single 8-byte target block and update its state machine
-void processTarget(int index, uint8_t* buf, uint32_t now) {
-  // 1. Parse X-Coordinate (Bytes 0 & 1) - Signed magnitude
-  int16_t x_val = ((buf[1] & 0x7F) << 8) | buf[0];
-  if ((buf[1] & 0x80) == 0) {
-    x_val = -x_val; // Bit 15 == 0 means negative X; Bit 15 == 1 means positive X
-  }
-
-  // 2. Parse Y-Coordinate (Bytes 2 & 3) - Strip errant sign bit for positive radial depth
-  int16_t y_val = ((buf[3] & 0x7F) << 8) | buf[2];
-
-  // 3. Parse Speed (Bytes 4 & 5) in cm/s
-  int16_t speed = ((buf[5] & 0x7F) << 8) | buf[4];
-  if ((buf[5] & 0x80) == 0) {
-    speed = -speed;
-  }
-
-  // Check if target slot is empty (LD2450 pads unused slots with 0x00)
-  if (x_val == 0 && y_val == 0) {
-    if (targets[index].active && (now - targets[index].lastSeenMs > TARGET_TIMEOUT_MS)) {
-      targets[index].active = false;
-      targets[index].lastZone = ZONE_UNKNOWN;
-    }
+void updateBlink() {
+  if (!blinkPattern) return;
+  if (millis() - blinkStepStart < blinkPattern[blinkStep]) return;
+  blinkStepStart = millis();
+  if (++blinkStep >= blinkLen) {
+    blinkPattern = nullptr;
+    digitalWrite(LED_PIN, LOW);
     return;
   }
+  digitalWrite(LED_PIN, (blinkStep % 2 == 0) ? HIGH : LOW);
+}
 
-  // 4. Y-Axis Validation Gate (Filter floor/ceiling noise & non-human objects)
-  if (y_val < MIN_Y_MM || y_val > MAX_Y_MM) {
-    return;
+void onDoorEvent(DoorCounter::Event ev, const DoorCounter::Track& t, const DoorCounter& c) {
+  if (ev == DoorCounter::ENTERED) startBlink(BLINK_ENTER, sizeof(BLINK_ENTER) / sizeof(BLINK_ENTER[0]));
+  else startBlink(BLINK_EXIT, sizeof(BLINK_EXIT) / sizeof(BLINK_EXIT[0]));
+
+  Serial.printf("[Track %u] %s (X: %d mm, Y: %d mm) | In: %lu  Out: %lu  Occupancy: %ld\n",
+                t.id, ev == DoorCounter::ENTERED ? "ENTERED" : "EXITED ",
+                t.x, t.y, (unsigned long)c.entries(), (unsigned long)c.exits(),
+                (long)c.occupancy());
+  if (ENABLE_WIFI) sendOccupancyUpdate(c.occupancy());
+}
+
+void printStatus() {
+  Serial.printf("Frames: %lu (bad: %lu), last frame %lu ms ago | In: %lu  Out: %lu  Occupancy: %ld\n",
+                (unsigned long)radar.frameCount(), (unsigned long)radar.badFrameCount(),
+                (unsigned long)(millis() - radar.lastFrameMs()),
+                (unsigned long)counter.entries(), (unsigned long)counter.exits(),
+                (long)counter.occupancy());
+}
+
+void printFrame() {
+  Serial.print("radar:");
+  for (uint8_t i = 0; i < LD2450::kMaxTargets; ++i) {
+    const LD2450::Target& t = radar.target(i);
+    if (t.valid) Serial.printf(" [%d,%d %dcm/s]", t.x, t.y, t.speed);
+  }
+  Serial.print("  tracks:");
+  for (uint8_t i = 0; i < DoorCounter::kMaxTracks; ++i) {
+    const DoorCounter::Track& t = counter.track(i);
+    if (t.active) {
+      Serial.printf(" #%u(%d,%d %s)", t.id, t.x, t.y,
+                    t.side > 0 ? "in" : (t.side < 0 ? "out" : "?"));
+    }
+  }
+  Serial.println();
+}
+
+void printConfig() {
+  const DoorCounter::Config& c = counter.config();
+  Serial.printf("Line %c = %d mm (+/-%d), inside is %c%c, ROI X[%d,%d] Y[%d,%d], confirm %u frames\n",
+                c.axis == DoorCounter::AXIS_X ? 'X' : 'Y', c.lineMm, c.hysteresisMm,
+                c.insideIsPositive ? '+' : '-', c.axis == DoorCounter::AXIS_X ? 'X' : 'Y',
+                c.xMinMm, c.xMaxMm, c.yMinMm, c.yMaxMm, c.confirmFrames);
+}
+
+void handleButton() {
+  static bool wasDown = false;
+  static uint32_t downSince = 0;
+  bool down = digitalRead(BUTTON_PIN) == LOW;
+  uint32_t now = millis();
+
+  if (down && !wasDown) downSince = now;
+  if (!down && wasDown) {
+    uint32_t held = now - downSince;
+    if (held < 50) {
+      // bounce
+    } else if (held < 1000) {
+      counter.reset();
+      Serial.println("Counts reset");
+      printStatus();
+    } else if (held < 3000) {
+      debugStream = !debugStream;
+      Serial.printf("Debug stream %s\n", debugStream ? "ON" : "OFF");
+    } else {
+      DoorCounter::Config c = counter.config();
+      c.insideIsPositive = !c.insideIsPositive;
+      counter.setConfig(c);
+      counter.reset();
+      Serial.println("Inside/outside swapped, counts reset");
+      printConfig();
+    }
+  }
+  wasDown = down;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delay(200);
+
+  // Geometry: radar on top of the door frame, antenna facing the floor, rotated
+  // so its X axis runs in the walking direction (perpendicular to the door).
+  // Y is then the distance straight down to the person, and the doorway is the
+  // line X = 0 directly under the sensor. The room is +X unless flipped (hold BOOT > 3 s).
+  DoorCounter::Config cfg;
+  cfg.axis = DoorCounter::AXIS_X;
+  cfg.lineMm = 0;
+  cfg.hysteresisMm = 150;
+  cfg.insideIsPositive = true;
+  cfg.xMinMm = -2500;
+  cfg.xMaxMm = 2500;
+  cfg.yMinMm = 150;
+  cfg.yMaxMm = 2500;
+  counter.setConfig(cfg);
+  counter.onEvent(onDoorEvent);
+
+  // Must come after Serial.begin(): this moves GPIO3 from UART0 to UART2.
+  // The LD2450 defaults to multi-target mode, so no configuration is sent.
+  radar.begin(Serial2, RADAR_RX_PIN, RADAR_TX_PIN);
+
+  if (ENABLE_WIFI) {
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
   }
 
-  targets[index].active = true;
-  targets[index].lastSeenMs = now;
-
-  // 5. X-Axis Hysteresis & Boundary Crossing State Machine
-  if (x_val > HYSTERESIS_MM) {
-    // Target is clearly in the INSIDE zone (+X)
-    if (targets[index].lastZone == ZONE_OUTSIDE) {
-      roomOccupancy++;
-      Serial.printf("[Target %d] ENTERED (X: %d mm, Y: %d mm, Speed: %d cm/s) | Total Occupancy: %d\n", 
-                    index + 1, x_val, y_val, speed, roomOccupancy);
-      // sendOccupancyUpdate(roomOccupancy);
-    }
-    targets[index].lastZone = ZONE_INSIDE;
-  } 
-  else if (x_val < -HYSTERESIS_MM) {
-    // Target is clearly in the OUTSIDE zone (-X)
-    if (targets[index].lastZone == ZONE_INSIDE) {
-      roomOccupancy = max(0, roomOccupancy - 1); // Prevent negative room counts
-      Serial.printf("[Target %d] EXITED  (X: %d mm, Y: %d mm, Speed: %d cm/s) | Total Occupancy: %d\n", 
-                    index + 1, x_val, y_val, speed, roomOccupancy);
-      // sendOccupancyUpdate(roomOccupancy);
-    }
-    targets[index].lastZone = ZONE_OUTSIDE;
-  }
-  // Note: If -150 <= x_val <= 150, target is inside the deadzone. Do nothing.
+  printConfig();
+  Serial.println("Ready. BOOT button: tap = reset counts, hold 1-3 s = debug stream, hold >3 s = swap in/out");
 }
 
 void loop() {
-  // Non-blocking byte-by-byte stream synchronization
-  while (Serial2.available() > 0) {
-    uint8_t byteIn = Serial2.read();
+  handleButton();
+  updateBlink();
 
-    if (headerIdx < 4) {
-      if (byteIn == HEADER[headerIdx]) {
-        headerIdx++;
-      } else {
-        headerIdx = (byteIn == HEADER[0]) ? 1 : 0;
-      }
-    } 
-    else {
-      // Header matched! Read the remaining 26 bytes (24B data + 2B footer)
-      size_t bytesRead = Serial2.readBytes(payloadBuf, 26);
-      headerIdx = 0; // Reset state machine for next frame
+  if (radar.update()) {
+    counter.update(radar);
+    if (debugStream) printFrame();
+  }
 
-      // Verify frame integrity via the 0x55 0xCC footer
-      if (bytesRead == 26 && payloadBuf[24] == 0x55 && payloadBuf[25] == 0xCC) {
-        uint32_t now = millis();
-        // Loop through all 3 targets (offsets 0, 8, and 16)
-        for (int i = 0; i < 3; i++) {
-          processTarget(i, &payloadBuf[i * 8], now);
-        }
-      }
+  static uint32_t lastWarn = 0;
+  if (millis() - radar.lastFrameMs() > 2000 && millis() - lastWarn > 2000) {
+    lastWarn = millis();
+    if (radar.bytesReceived() == 0) {
+      Serial.println("No data from LD2450 - check 5V power, shared GND with ESP32, and LD2450 TX -> GPIO3 (RX0)");
+    } else {
+      Serial.printf("LD2450 sending data (%lu bytes) but no valid frames - check baud (256000) / signal quality\n",
+                    (unsigned long)radar.bytesReceived());
     }
   }
 }
@@ -151,7 +206,7 @@ void sendOccupancyUpdate(int count) {
     http.begin(serverUrl);
     http.addHeader("Content-Type", "application/json");
     String payload = "{\"team\": 1, \"occupancy\": " + String(count) + "}";
-    int httpResponseCode = http.POST(payload);
+    http.POST(payload);
     http.end();
   }
 }
